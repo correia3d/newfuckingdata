@@ -20,8 +20,7 @@ RUN go mod download && \
   -X 'main.TibiaDataBuildBuilder=${TibiaDataBuildBuilder}' \
   -X 'main.TibiaDataBuildRelease=${TibiaDataBuildRelease}' \
   -X 'main.TibiaDataBuildCommit=${TibiaDataBuildCommit}' \
-  " -o app ./...
-
+  " -o app ./src/
 
 # get alpine container
 FROM alpine:3.22.1 AS app
