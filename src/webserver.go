@@ -2,17 +2,21 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"math/rand"
 	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/TibiaData/tibiadata-api-go/src/cache"
 	"github.com/TibiaData/tibiadata-api-go/src/validation"
 	_ "github.com/mantyr/go-charset/data"
 	"golang.org/x/text/cases"
@@ -30,7 +34,43 @@ var (
 
 	// ErrorNotFound will be returned if the requests ends up in a 404
 	ErrorNotFound = errors.New("page not found")
+
+	// Mapa para rastrear requisições de personagens em andamento
+	pendingCharacterRequests = make(map[string]chan interface{})
+	pendingMutex             = &sync.RWMutex{}
 )
+
+func generateCacheBuster() string {
+	// Palavra base
+	palavra := "euamooduartelindo"
+
+	// Comprimento desejado para o nome do parâmetro (ajuste conforme necessário)
+	tamanhoDesejado := 8
+
+	// Converter para runes
+	runes := []rune(palavra)
+
+	// Embaralhar as runes
+	rand.Shuffle(len(runes), func(i, j int) {
+		runes[i], runes[j] = runes[j], runes[i]
+	})
+
+	// Pegar apenas um subconjunto das runes embaralhadas
+	if len(runes) > tamanhoDesejado {
+		runes = runes[:tamanhoDesejado]
+	}
+
+	// Usar as runes selecionadas como nome do parâmetro e um número aleatório como valor
+	return string(runes) + "=" + strconv.Itoa(rand.Intn(99999))
+}
+
+func addCacheBusterToURL(url string) string {
+	separator := "?"
+	if strings.Contains(url, "?") {
+		separator = "&"
+	}
+	return url + separator + generateCacheBuster()
+}
 
 // DebugOutInformation wraps OutInformation with some debug info
 type DebugOutInformation struct {
@@ -268,7 +308,7 @@ func runWebServer() {
 func tibiaBoostableBosses(c *gin.Context) {
 	tibiadataRequest := TibiaDataRequestStruct{
 		Method:  resty.MethodGet,
-		URL:     "https://www.tibia.com/library/?subtopic=boostablebosses",
+		URL:     addCacheBusterToURL("https://www.tibia.com/library/?subtopic=boostablebosses"),
 		RawBody: true,
 	}
 
@@ -304,20 +344,83 @@ func tibiaCharactersCharacter(c *gin.Context) {
 		return
 	}
 
-	// Build the request structure
-	tibiadataRequest := TibiaDataRequestStruct{
-		Method: resty.MethodGet,
-		URL:    "https://www.tibia.com/community/?subtopic=characters&name=" + TibiaDataQueryEscapeString(name),
+	// Check cache
+	cacheKey := "character:" + name
+	if cache.Client != nil {
+		cachedData, err := cache.Get(cacheKey)
+		if err == nil {
+			// Cache hit
+			var data interface{}
+			if err := json.Unmarshal([]byte(cachedData), &data); err == nil {
+				TibiaDataAPIHandleResponse(c, "TibiaCharactersCharacter", data)
+				return
+			}
+		}
 	}
 
-	// Handle the request
-	tibiaDataRequestHandler(
-		c,
-		tibiadataRequest,
-		func(BoxContentHTML string) (interface{}, error) {
-			return TibiaCharactersCharacterImpl(BoxContentHTML, tibiadataRequest.URL)
-		},
-		"TibiaCharactersCharacter")
+	// Verificar se já existe uma requisição em andamento para este personagem
+	pendingMutex.RLock()
+	resultChan, hasPendingRequest := pendingCharacterRequests[name]
+	pendingMutex.RUnlock()
+
+	if hasPendingRequest {
+		// Aguardar o resultado da requisição existente
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+		defer cancel()
+
+		select {
+		case result := <-resultChan:
+			TibiaDataAPIHandleResponse(c, "TibiaCharactersCharacter", result)
+			return
+		case <-ctx.Done():
+			TibiaDataErrorHandler(c, errors.New("request timed out while waiting for pending request"), http.StatusRequestTimeout)
+			return
+		}
+	}
+
+	// Criar um canal para esta requisição
+	resultChan = make(chan interface{}, 1)
+	pendingMutex.Lock()
+	pendingCharacterRequests[name] = resultChan
+	pendingMutex.Unlock()
+
+	// Garantir que removemos do mapa quando terminar
+	defer func() {
+		pendingMutex.Lock()
+		delete(pendingCharacterRequests, name)
+		pendingMutex.Unlock()
+		close(resultChan)
+	}()
+
+	// Cache miss or error, proceed with normal request
+	tibiadataRequest := TibiaDataRequestStruct{
+		Method: resty.MethodGet,
+		URL:    addCacheBusterToURL("https://www.tibia.com/community/?subtopic=characters&name=" + TibiaDataQueryEscapeString(name)),
+	}
+
+	BoxContentHTML, err := TibiaDataHTMLDataCollector(tibiadataRequest)
+	if err != nil {
+		TibiaDataErrorHandler(c, err, 0)
+		return
+	}
+
+	data, err := TibiaCharactersCharacterImpl(BoxContentHTML, tibiadataRequest.URL)
+	if err != nil {
+		TibiaDataErrorHandler(c, err, 0)
+		return
+	}
+
+	// Armazenar em cache
+	if cache.Client != nil {
+		jsonData, _ := json.Marshal(data)
+		cache.Set(cacheKey, jsonData, cache.GetTTL("character"))
+	}
+
+	// Enviar o resultado para o canal para todos que estão aguardando
+	resultChan <- data
+
+	// Responder ao requisitante atual
+	TibiaDataAPIHandleResponse(c, "TibiaCharactersCharacter", data)
 }
 
 // Creatures godoc
@@ -432,16 +535,37 @@ func tibiaGuildsGuild(c *gin.Context) {
 		return
 	}
 
+	// Check cache
+	cacheKey := "guild:" + guild
+	if cache.Client != nil {
+		cachedData, err := cache.Get(cacheKey)
+		if err == nil {
+			// Cache hit
+			var data interface{}
+			if err := json.Unmarshal([]byte(cachedData), &data); err == nil {
+				TibiaDataAPIHandleResponse(c, "TibiaGuildsGuild", data)
+				return
+			}
+		}
+	}
+
+	// Add cache buster to URL
 	tibiadataRequest := TibiaDataRequestStruct{
 		Method: resty.MethodGet,
-		URL:    "https://www.tibia.com/community/?subtopic=guilds&page=view&GuildName=" + TibiaDataQueryEscapeString(guild),
+		URL:    addCacheBusterToURL("https://www.tibia.com/community/?subtopic=guilds&page=view&GuildName=" + TibiaDataQueryEscapeString(guild)),
 	}
 
 	tibiaDataRequestHandler(
 		c,
 		tibiadataRequest,
 		func(BoxContentHTML string) (interface{}, error) {
-			return TibiaGuildsGuildImpl(guild, BoxContentHTML, tibiadataRequest.URL)
+			data, err := TibiaGuildsGuildImpl(guild, BoxContentHTML, tibiadataRequest.URL)
+			if err == nil && cache.Client != nil {
+				// Cache the response using the configured TTL
+				jsonData, _ := json.Marshal(data)
+				cache.Set(cacheKey, jsonData, cache.GetTTL("guild"))
+			}
+			return data, err
 		},
 		"TibiaGuildsGuild")
 }
@@ -570,6 +694,22 @@ func tibiaHighscores(c *gin.Context) {
 		return
 	}
 
+	// Construir a chave de cache
+	cacheKey := fmt.Sprintf("highscores:%s:%s:%s:%s", world, category, vocationName, page)
+
+	// Verificar o cache
+	if cache.Client != nil {
+		cachedData, err := cache.Get(cacheKey)
+		if err == nil {
+			// Cache hit
+			var data interface{}
+			if err := json.Unmarshal([]byte(cachedData), &data); err == nil {
+				TibiaDataAPIHandleResponse(c, "TibiaHighscores", data)
+				return
+			}
+		}
+	}
+
 	tibiadataRequest := TibiaDataRequestStruct{
 		Method: resty.MethodGet,
 		URL:    "https://www.tibia.com/community/?subtopic=highscores&world=" + TibiaDataQueryEscapeString(world) + "&category=" + strconv.Itoa(int(highscoreCategory)) + "&profession=" + TibiaDataQueryEscapeString(vocationid) + "&currentpage=" + TibiaDataQueryEscapeString(page),
@@ -579,7 +719,13 @@ func tibiaHighscores(c *gin.Context) {
 		c,
 		tibiadataRequest,
 		func(BoxContentHTML string) (interface{}, error) {
-			return TibiaHighscoresImpl(world, highscoreCategory, vocationName, TibiaDataStringToInteger(page), BoxContentHTML, tibiadataRequest.URL)
+			data, err := TibiaHighscoresImpl(world, highscoreCategory, vocationName, TibiaDataStringToInteger(page), BoxContentHTML, tibiadataRequest.URL)
+			if err == nil && cache.Client != nil {
+				// Cache the response using the configured TTL
+				jsonData, _ := json.Marshal(data)
+				cache.Set(cacheKey, jsonData, cache.GetTTL("highscores"))
+			}
+			return data, err
 		},
 		"TibiaHighscores")
 }
@@ -611,6 +757,7 @@ func tibiaHousesHouse(c *gin.Context) {
 	// Adding fix for First letter to be upper and rest lower
 	world = TibiaDataStringWorldFormatToTitle(world)
 
+	// Check if world exists
 	// Check if world exists
 	exists, err := validation.WorldExists(world)
 	if err != nil {
@@ -1070,16 +1217,38 @@ func tibiaWorldsWorld(c *gin.Context) {
 		return
 	}
 
+	// Check cache
+	cacheKey := "world:" + world
+	if cache.Client != nil {
+		cachedData, err := cache.Get(cacheKey)
+		if err == nil {
+			// Cache hit
+			var data interface{}
+			if err := json.Unmarshal([]byte(cachedData), &data); err == nil {
+				TibiaDataAPIHandleResponse(c, "TibiaWorldsWorld", data)
+				return
+			}
+		}
+	}
+
+	// Continue with normal request
+	// Usando addCacheBusterToURL para adicionar parâmetro de cache busting
 	tibiadataRequest := TibiaDataRequestStruct{
 		Method: resty.MethodGet,
-		URL:    "https://www.tibia.com/community/?subtopic=worlds&world=" + TibiaDataQueryEscapeString(world),
+		URL:    addCacheBusterToURL("https://www.tibia.com/community/?subtopic=worlds&world=" + TibiaDataQueryEscapeString(world)),
 	}
 
 	tibiaDataRequestHandler(
 		c,
 		tibiadataRequest,
 		func(BoxContentHTML string) (interface{}, error) {
-			return TibiaWorldsWorldImpl(world, BoxContentHTML, tibiadataRequest.URL)
+			data, err := TibiaWorldsWorldImpl(world, BoxContentHTML, tibiadataRequest.URL)
+			if err == nil && cache.Client != nil {
+				// Cache the response using the configured TTL
+				jsonData, _ := json.Marshal(data)
+				cache.Set(cacheKey, jsonData, cache.GetTTL("world"))
+			}
+			return data, err
 		},
 		"TibiaWorldsWorld")
 }

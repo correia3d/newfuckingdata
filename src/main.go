@@ -2,8 +2,10 @@ package main
 
 import (
 	"log"
+	"strconv"
 	"sync/atomic"
 
+	"github.com/TibiaData/tibiadata-api-go/src/cache"
 	"github.com/TibiaData/tibiadata-api-go/src/validation"
 )
 
@@ -88,6 +90,8 @@ func init() {
 		panic(err)
 	}
 
+	// Initialize Redis cache
+	initializeCache()
 }
 
 func main() {
@@ -96,6 +100,37 @@ func main() {
 
 	// Starting the webserver
 	runWebServer()
+}
+
+// initializeCache configura o Redis cache baseado nas variáveis de ambiente
+func initializeCache() {
+	// Tentar configurar via REDIS_URL primeiro
+	if redisURL := getEnv("REDIS_URL", ""); redisURL != "" {
+		if err := cache.SetupWithURL(redisURL); err != nil {
+			log.Printf("[warning] Failed to setup Redis cache with URL: %v", err)
+			return
+		}
+		log.Printf("[info] Redis cache initialized successfully with URL")
+		return
+	}
+
+	// Fallback para configuração manual
+	redisAddr := getEnv("REDIS_ADDR", "")
+	if redisAddr != "" {
+		redisPassword := getEnv("REDIS_PASSWORD", "")
+		redisDB := 0 // Usar DB 0 por padrão
+		if dbStr := getEnv("REDIS_DB", ""); dbStr != "" {
+			if db, err := strconv.Atoi(dbStr); err == nil {
+				redisDB = db
+			}
+		}
+
+		cache.Setup(redisAddr, redisPassword, redisDB)
+		log.Printf("[info] Redis cache initialized successfully at %s", redisAddr)
+		return
+	}
+
+	log.Printf("[info] Redis cache not configured - running without cache")
 }
 
 // TibiaDataInitializer set the background for the webserver
@@ -154,5 +189,4 @@ func TibiaDataInitializer() {
 	_ = tibiaSpellsSpellV3()
 	_ = tibiaWorldsOverviewV3()
 	_ = tibiaWorldsWorldV3()
-
 }
