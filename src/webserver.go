@@ -349,12 +349,10 @@ func tibiaCharactersCharacter(c *gin.Context) {
 	if cache.Client != nil {
 		cachedData, err := cache.Get(cacheKey)
 		if err == nil {
-			// Cache hit
-			var data interface{}
-			if err := json.Unmarshal([]byte(cachedData), &data); err == nil {
-				TibiaDataAPIHandleResponse(c, "TibiaCharactersCharacter", data)
-				return
-			}
+			// Cache hit - retorna JSON original preservando ordem
+			c.Header("Content-Type", "application/json")
+			c.String(http.StatusOK, cachedData)
+			return
 		}
 	}
 
@@ -370,7 +368,14 @@ func tibiaCharactersCharacter(c *gin.Context) {
 
 		select {
 		case result := <-resultChan:
-			TibiaDataAPIHandleResponse(c, "TibiaCharactersCharacter", result)
+			// result agora contém o JSON como string
+			if jsonStr, ok := result.(string); ok {
+				c.Header("Content-Type", "application/json")
+				c.String(http.StatusOK, jsonStr)
+			} else {
+				// Fallback caso seja interface{}
+				TibiaDataAPIHandleResponse(c, "TibiaCharactersCharacter", result)
+			}
 			return
 		case <-ctx.Done():
 			TibiaDataErrorHandler(c, errors.New("request timed out while waiting for pending request"), http.StatusRequestTimeout)
@@ -410,17 +415,48 @@ func tibiaCharactersCharacter(c *gin.Context) {
 		return
 	}
 
-	// Armazenar em cache
-	if cache.Client != nil {
-		jsonData, _ := json.Marshal(data)
-		cache.Set(cacheKey, jsonData, cache.GetTTL("character"))
-	}
+	// Usar a nova função que preserva ordem e salva no cache
+	jsonString := TibiaDataAPIHandleResponseWithCache(c, "TibiaCharactersCharacter", data, cacheKey, cache.GetTTL("character"))
 
 	// Enviar o resultado para o canal para todos que estão aguardando
-	resultChan <- data
+	resultChan <- jsonString
+}
 
-	// Responder ao requisitante atual
-	TibiaDataAPIHandleResponse(c, "TibiaCharactersCharacter", data)
+func TibiaDataAPIHandleResponseWithCache(c *gin.Context, handlerName string, data interface{}, cacheKey string, ttl time.Duration) string {
+	// print to log about request
+	if gin.IsDebugging() {
+		log.Println("[debug] " + handlerName + " - (" + c.Request.RequestURI + ") returned data:")
+		js, err := json.Marshal(data)
+		log.Printf("[debug] %s\n", js)
+		if err != nil {
+			log.Printf("[debug] the above had an error: %s\n", err)
+		}
+	}
+
+	if TibiaDataDebug {
+		log.Println("[info] " + handlerName + " - (" + c.Request.RequestURI + ") executed successfully.")
+	}
+
+	// Converter para JSON preservando a ordem da struct
+	jsonBytes, err := json.Marshal(data)
+	if err != nil {
+		// Se falhar, usar método antigo
+		c.JSON(http.StatusOK, data)
+		return ""
+	}
+
+	jsonString := string(jsonBytes)
+
+	// Salvar no cache se disponível
+	if cache.Client != nil && cacheKey != "" {
+		cache.Set(cacheKey, jsonString, ttl)
+	}
+
+	// Retornar response com JSON string preservando ordem
+	c.Header("Content-Type", "application/json")
+	c.String(http.StatusOK, jsonString)
+
+	return jsonString
 }
 
 // Creatures godoc
