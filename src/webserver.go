@@ -360,7 +360,7 @@ func tibiaCharactersCharacter(c *gin.Context) {
 		return
 	}
 
-	// Normalizar nome para cache
+	// Normalizar nome para cache e requisições
 	normalizedName := TibiaDataNormalizeName(name)
 	cacheKey := "character:" + normalizedName
 
@@ -411,10 +411,10 @@ func tibiaCharactersCharacter(c *gin.Context) {
 		close(resultChan)
 	}()
 
-	// Cache miss, fazer requisição usando nome original
+	// Cache miss, fazer requisição usando nome normalizado
 	tibiadataRequest := TibiaDataRequestStruct{
 		Method: resty.MethodGet,
-		URL:    addCacheBusterToURL("https://www.tibia.com/community/?subtopic=characters&name=" + TibiaDataQueryEscapeString(name)),
+		URL:    addCacheBusterToURL("https://www.tibia.com/community/?subtopic=characters&name=" + TibiaDataQueryEscapeString(normalizedName)),
 	}
 
 	BoxContentHTML, err := TibiaDataHTMLDataCollector(tibiadataRequest)
@@ -602,8 +602,11 @@ func tibiaGuildsGuild(c *gin.Context) {
 		return
 	}
 
-	// Check cache
-	cacheKey := "guild:" + guild
+	// Normalizar nome para cache
+	normalizedGuild := TibiaDataNormalizeName(guild)
+	cacheKey := "guild:" + normalizedGuild
+
+	// Check cache usando nome normalizado
 	if cache.Client != nil {
 		cachedData, err := cache.Get(cacheKey)
 		if err == nil {
@@ -616,7 +619,7 @@ func tibiaGuildsGuild(c *gin.Context) {
 		}
 	}
 
-	// Add cache buster to URL
+	// Add cache buster to URL (usando nome original)
 	tibiadataRequest := TibiaDataRequestStruct{
 		Method: resty.MethodGet,
 		URL:    addCacheBusterToURL("https://www.tibia.com/community/?subtopic=guilds&page=view&GuildName=" + TibiaDataQueryEscapeString(guild)),
@@ -628,7 +631,7 @@ func tibiaGuildsGuild(c *gin.Context) {
 		func(BoxContentHTML string) (interface{}, error) {
 			data, err := TibiaGuildsGuildImpl(guild, BoxContentHTML, tibiadataRequest.URL)
 			if err == nil && cache.Client != nil {
-				// Cache the response using the configured TTL
+				// Cache usando nome normalizado
 				jsonData, _ := json.Marshal(data)
 				cache.Set(cacheKey, jsonData, cache.GetTTL("guild"))
 			}
