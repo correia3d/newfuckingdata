@@ -321,6 +321,22 @@ func tibiaBoostableBosses(c *gin.Context) {
 		"TibiaBoostableBosses")
 }
 
+func TibiaDataNormalizeName(name string) string {
+	// Remove espaços extras e converte para lowercase
+	normalized := strings.ToLower(strings.TrimSpace(name))
+
+	// Remove caracteres especiais que podem aparecer em URLs (%20, +, etc)
+	normalized = strings.ReplaceAll(normalized, "%20", " ")
+	normalized = strings.ReplaceAll(normalized, "+", " ")
+
+	// Remove espaços múltiplos
+	for strings.Contains(normalized, "  ") {
+		normalized = strings.ReplaceAll(normalized, "  ", " ")
+	}
+
+	return strings.TrimSpace(normalized)
+}
+
 // Character godoc
 // @Summary      Show one character
 // @Description  Show all information about one character available
@@ -337,28 +353,33 @@ func tibiaCharactersCharacter(c *gin.Context) {
 	// Getting params from URL
 	name := c.Param("name")
 
-	// Validate the name
+	// Validate the name (usando o nome original)
 	err := validation.IsCharacterNameValid(name)
 	if err != nil {
 		TibiaDataErrorHandler(c, err, http.StatusBadRequest)
 		return
 	}
 
-	// Check cache
-	cacheKey := "character:" + name
+	// Normalizar nome para cache
+	normalizedName := TibiaDataNormalizeName(name)
+	cacheKey := "character:" + normalizedName
+
+	// Check cache usando nome normalizado
 	if cache.Client != nil {
 		cachedData, err := cache.Get(cacheKey)
 		if err == nil {
-			// Cache hit - retorna JSON original preservando ordem
-			c.Header("Content-Type", "application/json")
-			c.String(http.StatusOK, cachedData)
-			return
+			// Cache hit
+			var data interface{}
+			if err := json.Unmarshal([]byte(cachedData), &data); err == nil {
+				TibiaDataAPIHandleResponse(c, "TibiaCharactersCharacter", data)
+				return
+			}
 		}
 	}
 
-	// Verificar se já existe uma requisição em andamento para este personagem
+	// Verificar se já existe uma requisição em andamento usando nome normalizado
 	pendingMutex.RLock()
-	resultChan, hasPendingRequest := pendingCharacterRequests[name]
+	resultChan, hasPendingRequest := pendingCharacterRequests[normalizedName]
 	pendingMutex.RUnlock()
 
 	if hasPendingRequest {
@@ -368,14 +389,7 @@ func tibiaCharactersCharacter(c *gin.Context) {
 
 		select {
 		case result := <-resultChan:
-			// result agora contém o JSON como string
-			if jsonStr, ok := result.(string); ok {
-				c.Header("Content-Type", "application/json")
-				c.String(http.StatusOK, jsonStr)
-			} else {
-				// Fallback caso seja interface{}
-				TibiaDataAPIHandleResponse(c, "TibiaCharactersCharacter", result)
-			}
+			TibiaDataAPIHandleResponse(c, "TibiaCharactersCharacter", result)
 			return
 		case <-ctx.Done():
 			TibiaDataErrorHandler(c, errors.New("request timed out while waiting for pending request"), http.StatusRequestTimeout)
@@ -383,21 +397,21 @@ func tibiaCharactersCharacter(c *gin.Context) {
 		}
 	}
 
-	// Criar um canal para esta requisição
+	// Criar um canal para esta requisição usando nome normalizado
 	resultChan = make(chan interface{}, 1)
 	pendingMutex.Lock()
-	pendingCharacterRequests[name] = resultChan
+	pendingCharacterRequests[normalizedName] = resultChan
 	pendingMutex.Unlock()
 
 	// Garantir que removemos do mapa quando terminar
 	defer func() {
 		pendingMutex.Lock()
-		delete(pendingCharacterRequests, name)
+		delete(pendingCharacterRequests, normalizedName)
 		pendingMutex.Unlock()
 		close(resultChan)
 	}()
 
-	// Cache miss or error, proceed with normal request
+	// Cache miss, fazer requisição usando nome original
 	tibiadataRequest := TibiaDataRequestStruct{
 		Method: resty.MethodGet,
 		URL:    addCacheBusterToURL("https://www.tibia.com/community/?subtopic=characters&name=" + TibiaDataQueryEscapeString(name)),
@@ -406,20 +420,37 @@ func tibiaCharactersCharacter(c *gin.Context) {
 	BoxContentHTML, err := TibiaDataHTMLDataCollector(tibiadataRequest)
 	if err != nil {
 		TibiaDataErrorHandler(c, err, 0)
-		return
+		// Enviar erro para todos os canais pendentes
+		select {
+		case resultChan <- nil:
+		default:
+		}
+	} else {
+		data, err := TibiaCharactersCharacterImpl(BoxContentHTML, tibiadataRequest.URL)
+		if err != nil {
+			TibiaDataErrorHandler(c, err, 0)
+			// Enviar erro para todos os canais pendentes
+			select {
+			case resultChan <- nil:
+			default:
+			}
+		} else {
+			// Armazenar em cache usando nome normalizado
+			if cache.Client != nil {
+				jsonData, _ := json.Marshal(data)
+				cache.Set(cacheKey, jsonData, cache.GetTTL("character"))
+			}
+
+			// Enviar o resultado para o canal para todos que estão aguardando
+			select {
+			case resultChan <- data:
+			default:
+			}
+
+			// Responder ao requisitante atual
+			TibiaDataAPIHandleResponse(c, "TibiaCharactersCharacter", data)
+		}
 	}
-
-	data, err := TibiaCharactersCharacterImpl(BoxContentHTML, tibiadataRequest.URL)
-	if err != nil {
-		TibiaDataErrorHandler(c, err, 0)
-		return
-	}
-
-	// Usar a nova função que preserva ordem e salva no cache
-	jsonString := TibiaDataAPIHandleResponseWithCache(c, "TibiaCharactersCharacter", data, cacheKey, cache.GetTTL("character"))
-
-	// Enviar o resultado para o canal para todos que estão aguardando
-	resultChan <- jsonString
 }
 
 func TibiaDataAPIHandleResponseWithCache(c *gin.Context, handlerName string, data interface{}, cacheKey string, ttl time.Duration) string {
