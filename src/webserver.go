@@ -368,12 +368,10 @@ func tibiaCharactersCharacter(c *gin.Context) {
 	if cache.Client != nil {
 		cachedData, err := cache.Get(cacheKey)
 		if err == nil {
-			// Cache hit
-			var data interface{}
-			if err := json.Unmarshal([]byte(cachedData), &data); err == nil {
-				TibiaDataAPIHandleResponse(c, "TibiaCharactersCharacter", data)
-				return
-			}
+			// Cache hit - retornar string JSON diretamente
+			c.Header("Content-Type", "application/json")
+			c.String(http.StatusOK, cachedData)
+			return
 		}
 	}
 
@@ -389,7 +387,15 @@ func tibiaCharactersCharacter(c *gin.Context) {
 
 		select {
 		case result := <-resultChan:
-			TibiaDataAPIHandleResponse(c, "TibiaCharactersCharacter", result)
+			if result != nil {
+				// Se result é uma string JSON, usar diretamente
+				if jsonStr, ok := result.(string); ok {
+					c.Header("Content-Type", "application/json")
+					c.String(http.StatusOK, jsonStr)
+				} else {
+					TibiaDataAPIHandleResponse(c, "TibiaCharactersCharacter", result)
+				}
+			}
 			return
 		case <-ctx.Done():
 			TibiaDataErrorHandler(c, errors.New("request timed out while waiting for pending request"), http.StatusRequestTimeout)
@@ -435,20 +441,29 @@ func tibiaCharactersCharacter(c *gin.Context) {
 			default:
 			}
 		} else {
-			// Armazenar em cache usando nome normalizado
-			if cache.Client != nil {
-				jsonData, _ := json.Marshal(data)
-				cache.Set(cacheKey, jsonData, cache.GetTTL("character"))
+			// Converter para JSON preservando ordem
+			jsonData, err := json.Marshal(data)
+			if err != nil {
+				TibiaDataErrorHandler(c, errors.New("failed to marshal JSON"), http.StatusInternalServerError)
+				return
 			}
 
-			// Enviar o resultado para o canal para todos que estão aguardando
+			jsonString := string(jsonData)
+
+			// Armazenar no cache como string JSON
+			if cache.Client != nil {
+				cache.Set(cacheKey, jsonString, cache.GetTTL("character"))
+			}
+
+			// Enviar string JSON para o canal para todos que estão aguardando
 			select {
-			case resultChan <- data:
+			case resultChan <- jsonString:
 			default:
 			}
 
-			// Responder ao requisitante atual
-			TibiaDataAPIHandleResponse(c, "TibiaCharactersCharacter", data)
+			// Responder ao requisitante atual com string JSON preservando ordem
+			c.Header("Content-Type", "application/json")
+			c.String(http.StatusOK, jsonString)
 		}
 	}
 }
