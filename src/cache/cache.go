@@ -92,9 +92,9 @@ func GetTTL(dataType string) time.Duration {
 		}
 		return 60 * time.Second // valor padrão se não configurado ou inválido
 	case "world":
-		return 10 * time.Second
+		return 5 * time.Second
 	case "guild":
-		return 10 * time.Second
+		return 5 * time.Second
 	case "highscores":
 		return 1 * time.Minute
 	default:
